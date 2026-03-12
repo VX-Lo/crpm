@@ -1,5 +1,5 @@
 # CRPM - Clarity Roleplaying Mechanics
-# Author: Lxtus (and ChatGPT)
+# Author: Lxtus (and Claude)
 # License: GPL-3.0
 # Copyright (C) 2026 Lxtus
 # This program is free software under the GNU General Public License v3.0
@@ -7,8 +7,8 @@
 ## Interface: 120001
 ## Title: CRPM
 ## Notes: Clarity Roleplaying Mechanics - lightweight dice rolling with custom modifiers
-## Author: Lxtus (and ChatGPT)
-## Version: 0.3.0
+## Author: Lxtus (and Claude)
+## Version: 1.0.0
 ## SavedVariablesPerCharacter: CRPM_Sheet, CRPM_Settings
 ## IconTexture: Interface\ICONS\Inv_misc_dice_02
 ## Category: Roleplay
