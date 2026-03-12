@@ -259,6 +259,8 @@ function Comm:OnCallMessage(parts, sender)
 end
 
 function Comm:BroadcastCall(expr)
+    local escape = CRPM.EscapeField
+
     expr = CRPM:SanitizeExpressionInput(expr)
 
     if expr == "" then
@@ -269,13 +271,21 @@ function Comm:BroadcastCall(expr)
         return false, ("Expression is too long (max %d characters)."):format(C.MAX_EXPRESSION_LEN)
     end
 
-    local distribution = self:GetDistribution()
+    local distribution, target = self:GetDistribution()
     if not distribution then
-        return false, "You are not in a party or raid."
+        return false, "You are not in a group and have no CRPM channel. Join a party or /join a channel named CRPMsomething."
     end
 
-    local message = "C|" .. CRPM.EscapeField(expr)
-    return self:Send(message, distribution)
+    local rpName = escape(CRPM.Sheet:GetName())
+    rpName = truncateEscaped(rpName, 48)
+
+    local message = table.concat({ "C", rpName, escape(expr) }, "|")
+
+    if #message > C.MAX_MESSAGE_LEN then
+        return false, "Call expression too large to broadcast."
+    end
+
+    return self:Send(message, distribution, target)
 end
 
 function Comm:GenerateRequestId()
