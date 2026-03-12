@@ -78,3 +78,5 @@ CRPM is meant to stay small and focused. There are already addons for broader RP
 Parts of this addon were reviewed, edited, and rewritten by AI.
 
 [CurseForge Project Page](https://www.curseforge.com/wow/addons/crpm)
+
+This project is licensed under GPL‑3 — you’re free to use, modify, and share it, but derivative work must stay under the same license. Read the full license [here](https://www.gnu.org/licenses/gpl-3.0.html).
