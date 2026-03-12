@@ -70,7 +70,7 @@ CRPM is meant to stay small and focused. There are already addons for broader RP
 
 ### A couple notes:
 - The name on your CRPM sheet is the name that prints in CRPM chat output.
-- Attribute names are custom, but for parser sanity they should be kept expression-friendly.
+- Attribute names are custom, but for parser sanity (and my own) they have to be kept expression-friendly.
 - If you want to use CRPM outside of a party or raid, join a custom channel whose name starts with CRPM.
 
 
