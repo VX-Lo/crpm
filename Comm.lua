@@ -1,11 +1,34 @@
 local ADDON_NAME, NS = ...
 local CRPM = NS.CRPM
 
+-- Public communication subsystem.
+-- Responsible for:
+--   - addon message prefix registration
+--   - selecting an appropriate distribution channel
+--   - serializing/broadcasting rolls and roll calls
+--   - request/response handling for shared character sheets
 CRPM.Comm = CRPM.Comm or {}
 local Comm = CRPM.Comm
 
+-- Shared constants used for transport limits and protocol sizing.
 local C = CRPM.Constants
 
+-------------------------------------------------------------------------------
+-- Utility helpers
+-------------------------------------------------------------------------------
+
+-- Splits a string on literal pipe characters.
+--
+-- Parameters:
+--   message - source string
+--   limit   - optional maximum number of parts to return
+--
+-- Behavior:
+--   - when `limit` is omitted, all parts are returned
+--   - when `limit` is provided, at most `limit` elements are returned and the
+--     final element contains the unsplit remainder
+--
+-- This is used for addon protocol frames where `|` is the field delimiter.
 local function splitPipe(message, limit)
     local parts = {}
     local startPos = 1
@@ -29,6 +52,8 @@ local function splitPipe(message, limit)
     return parts
 end
 
+-- Shortens text for display-oriented transport fields.
+-- When truncation is required and room permits, an ellipsis is appended.
 local function abbreviate(text, maxLen)
     text = tostring(text or "")
     if #text <= maxLen then
@@ -42,6 +67,12 @@ local function abbreviate(text, maxLen)
     return text:sub(1, maxLen - 3) .. "..."
 end
 
+-- Truncates an already-escaped field without cutting through an escape
+-- sequence such as `%25` or `%7C`.
+--
+-- The wire format relies on `%XX`-style escape tokens. Truncating in the
+-- middle of one would corrupt decoding on the receiving side, so this helper
+-- backs up to a safe boundary when necessary.
 local function truncateEscaped(s, maxLen)
     if #s <= maxLen then
         return s
@@ -62,6 +93,12 @@ local function truncateEscaped(s, maxLen)
     return s:sub(1, cut)
 end
 
+-------------------------------------------------------------------------------
+-- Initialization
+-------------------------------------------------------------------------------
+
+-- Initializes communication state and registers the addon message prefix with
+-- the WoW client.
 function Comm:Init()
     self.pendingSheets = self.pendingSheets or {}
     self._requestCounter = self._requestCounter or 0
@@ -72,6 +109,17 @@ function Comm:Init()
     end
 end
 
+-------------------------------------------------------------------------------
+-- Channel / distribution selection
+-------------------------------------------------------------------------------
+
+-- Searches joined chat channels for one whose name begins with `crpm`.
+-- Returns:
+--   channelId, channelName
+-- or:
+--   nil, nil
+--
+-- This provides a fallback transport when the player is not grouped.
 function Comm:FindCRPMChannel()
     for i = 1, 20 do
         local id, name = GetChannelName(i)
@@ -85,6 +133,19 @@ function Comm:FindCRPMChannel()
     return nil, nil
 end
 
+-- Determines the preferred outbound addon-message distribution.
+--
+-- Priority:
+--   1. instance chat
+--   2. raid
+--   3. party
+--   4. user-joined channel beginning with `CRPM`
+--
+-- Returns:
+--   distribution, target
+--
+-- `target` is only meaningful for `CHANNEL`, where it is the numeric channel
+-- id required by `SendAddonMessage`.
 function Comm:GetDistribution()
     if IsInGroup and LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
         return "INSTANCE_CHAT", nil
@@ -106,6 +167,21 @@ function Comm:GetDistribution()
     return nil, nil
 end
 
+-------------------------------------------------------------------------------
+-- Low-level send
+-------------------------------------------------------------------------------
+
+-- Sends a raw addon message through the requested distribution.
+--
+-- Parameters:
+--   message      - serialized protocol payload
+--   distribution - WoW addon message distribution
+--   target       - whisper target or channel id when required
+--
+-- Returns:
+--   true
+-- or:
+--   false, errorMessage
 function Comm:Send(message, distribution, target)
     if type(message) ~= "string" or message == "" then
         return false, "Cannot send an empty addon message."
@@ -137,9 +213,22 @@ function Comm:Send(message, distribution, target)
     return true
 end
 
+-------------------------------------------------------------------------------
+-- Broadcast: roll results
+-------------------------------------------------------------------------------
+
+-- Broadcasts a completed roll result to the current group/channel context.
+--
+-- Protocol format:
+--   R|rpName|expr|expanded|display|total
+--
+-- To remain inside message-size limits, text fields are escaped and then
+-- truncated according to a simple budget split.
 function Comm:BroadcastRoll(result)
     local distribution, target = self:GetDistribution()
     if not distribution then
+        -- Local rolling still works without a channel; lack of a distribution
+        -- is not considered an operational failure here.
         return true
     end
 
@@ -151,7 +240,7 @@ function Comm:BroadcastRoll(result)
     local total = tostring(result.total or 0)
 
     -- Message format: R|rpName|expr|expanded|display|total
-    -- 6 fields, 5 pipe separators, "R" prefix = 6 bytes overhead.
+    -- 6 fields, 5 pipe separators, plus the one-byte message type.
     local overhead = 6
     local budget = C.MAX_MESSAGE_LEN - overhead - #total - #rpName
 
@@ -164,6 +253,8 @@ function Comm:BroadcastRoll(result)
     local expanded = escape(result.expanded or "")
     local display = escape(result.display or "")
 
+    -- Allocate most space to the user-entered expression and evaluated display,
+    -- with a smaller share for the expanded attribute-substituted form.
     local exprBudget = math.floor(budget * 0.35)
     local expandedBudget = math.floor(budget * 0.30)
     local displayBudget = budget - exprBudget - expandedBudget
@@ -184,6 +275,15 @@ function Comm:BroadcastRoll(result)
     return self:Send(message, distribution, target)
 end
 
+-------------------------------------------------------------------------------
+-- Broadcast: roll calls
+-------------------------------------------------------------------------------
+
+-- Broadcasts a "call for roll" expression to the current group/channel
+-- context.
+--
+-- Protocol format:
+--   C|rpName|expr
 function Comm:BroadcastCall(expr)
     local escape = CRPM.EscapeField
 
@@ -205,7 +305,6 @@ function Comm:BroadcastCall(expr)
     local rpName = escape(CRPM.Sheet:GetName())
     rpName = truncateEscaped(rpName, 48)
 
-    -- Message format: C|rpName|expr
     local message = table.concat({ "C", rpName, escape(expr) }, "|")
 
     if #message > C.MAX_MESSAGE_LEN then
@@ -215,6 +314,12 @@ function Comm:BroadcastCall(expr)
     return self:Send(message, distribution, target)
 end
 
+-------------------------------------------------------------------------------
+-- Inbound message handlers
+-------------------------------------------------------------------------------
+
+-- Handles an inbound roll-result message from another player.
+-- Ignores messages originating from the local player.
 function Comm:OnRollMessage(parts, sender)
     if sender == CRPM:GetPlayerFullName() then
         return
@@ -240,6 +345,8 @@ function Comm:OnRollMessage(parts, sender)
     CRPM.UI:PrintRoll(sender, result)
 end
 
+-- Handles an inbound roll-call message from another player.
+-- Stores the expression as the current `/crpm lastcall` target.
 function Comm:OnCallMessage(parts, sender)
     if sender == CRPM:GetPlayerFullName() then
         return
@@ -258,41 +365,21 @@ function Comm:OnCallMessage(parts, sender)
     CRPM.UI:PrintRollCall(sender, expr, false, rpName)
 end
 
-function Comm:BroadcastCall(expr)
-    local escape = CRPM.EscapeField
+-------------------------------------------------------------------------------
+-- Request / response: shared sheets
+-------------------------------------------------------------------------------
 
-    expr = CRPM:SanitizeExpressionInput(expr)
-
-    if expr == "" then
-        return false, "Missing roll expression."
-    end
-
-    if #expr > C.MAX_EXPRESSION_LEN then
-        return false, ("Expression is too long (max %d characters)."):format(C.MAX_EXPRESSION_LEN)
-    end
-
-    local distribution, target = self:GetDistribution()
-    if not distribution then
-        return false, "You are not in a group and have no CRPM channel. Join a party or /join a channel named CRPMsomething."
-    end
-
-    local rpName = escape(CRPM.Sheet:GetName())
-    rpName = truncateEscaped(rpName, 48)
-
-    local message = table.concat({ "C", rpName, escape(expr) }, "|")
-
-    if #message > C.MAX_MESSAGE_LEN then
-        return false, "Call expression too large to broadcast."
-    end
-
-    return self:Send(message, distribution, target)
-end
-
+-- Generates a request id unique enough for the current session.
+-- Combines coarse wall-clock time with a local monotonic counter.
 function Comm:GenerateRequestId()
     self._requestCounter = (self._requestCounter or 0) + 1
     return ("%d-%d"):format(time(), self._requestCounter)
 end
 
+-- Sends a direct whisper request asking another player to share their sheet.
+--
+-- Protocol format:
+--   Q|requestId
 function Comm:RequestSheet(target)
     target = CRPM.Trim(target or "")
     if target == "" then
@@ -304,6 +391,11 @@ function Comm:RequestSheet(target)
     return self:Send(message, "WHISPER", target)
 end
 
+-- Responds to a sheet query by serializing the current sheet and sending it in
+-- one or more whisper chunks.
+--
+-- Protocol format:
+--   S|requestId|partIndex|totalParts|chunk
 function Comm:RespondWithSheet(target, requestId)
     local payload = CRPM.Sheet:SerializeCurrent()
     local chunkSize = C.MAX_SHEET_CHUNK
@@ -330,6 +422,8 @@ function Comm:RespondWithSheet(target, requestId)
     return true
 end
 
+-- Removes stale in-flight sheet assemblies.
+-- This prevents abandoned partial responses from accumulating indefinitely.
 function Comm:CleanupPending()
     local now = GetTime and GetTime() or 0
 
@@ -340,6 +434,8 @@ function Comm:CleanupPending()
     end
 end
 
+-- Handles an inbound sheet query.
+-- Queries are only honored via whisper to avoid unsolicited public responses.
 function Comm:OnQueryMessage(parts, distribution, sender)
     if distribution ~= "WHISPER" then
         return
@@ -353,6 +449,8 @@ function Comm:OnQueryMessage(parts, distribution, sender)
     self:RespondWithSheet(sender, requestId)
 end
 
+-- Handles one chunk of a remote serialized sheet response.
+-- Chunks are buffered until all parts arrive, then assembled and deserialized.
 function Comm:OnSheetChunk(parts, sender)
     local requestId = parts[2]
     local partIndex = tonumber(parts[3] or "")
@@ -367,6 +465,8 @@ function Comm:OnSheetChunk(parts, sender)
         return
     end
 
+    -- Composite key isolates concurrent responses from different senders and/or
+    -- different requests from the same sender.
     local key = sender .. "\031" .. requestId
     local now = GetTime and GetTime() or 0
 
@@ -381,6 +481,8 @@ function Comm:OnSheetChunk(parts, sender)
         self.pendingSheets[key] = state
     end
 
+    -- Count only the first arrival for each part index so duplicates do not
+    -- cause premature completion.
     if not state.parts[partIndex] then
         state.received = state.received + 1
     end
@@ -405,6 +507,13 @@ function Comm:OnSheetChunk(parts, sender)
     CRPM:Print(("Received character sheet from %s."):format(CRPM:ShortPlayerName(sender)))
 end
 
+-------------------------------------------------------------------------------
+-- Top-level dispatch
+-------------------------------------------------------------------------------
+
+-- Main addon-message entry point.
+-- Validates prefix/payload, performs light housekeeping, then dispatches to
+-- the appropriate message-specific handler.
 function Comm:OnAddonMessage(prefix, message, distribution, sender)
     if prefix ~= C.ADDON_PREFIX then
         return
