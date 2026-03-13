@@ -1,19 +1,26 @@
 local ADDON_NAME, NS = ...
 local CRPM = NS.CRPM
 
+-- Public UI namespace for this addon module.
 CRPM.UI = CRPM.UI or {}
 local UI = CRPM.UI
 
+-- Shared constants table.
 local C = CRPM.Constants
 
 -------------------------------------------------------------------------------
 -- Static popup for attribute deletion
 -------------------------------------------------------------------------------
 
+-- Confirmation dialog used before removing an attribute row from the
+-- character sheet. The row index is passed in the popup's `data` table.
 StaticPopupDialogs["CRPM_CONFIRM_DELETE_ATTR"] = {
     text = "Remove attribute '%s'?",
     button1 = "Remove",
     button2 = "Cancel",
+
+    -- Called when the user confirms deletion.
+    -- Expects `data.index` to identify the attribute row to remove.
     OnAccept = function(self, data)
         if not data or not data.index then
             return
@@ -25,11 +32,16 @@ StaticPopupDialogs["CRPM_CONFIRM_DELETE_ATTR"] = {
             return
         end
 
+        -- Refresh the visible sheet so row state matches the model.
         CRPM.UI:RefreshSheetFrame()
     end,
+
     timeout = 0,
     whileDead = true,
     hideOnEscape = true,
+
+    -- Avoids clashes with Blizzard popups/addons that may reserve the first
+    -- indices; this is a common WoW UI compatibility practice.
     preferredIndex = 3,
 }
 
@@ -37,6 +49,7 @@ StaticPopupDialogs["CRPM_CONFIRM_DELETE_ATTR"] = {
 -- Visual constants
 -------------------------------------------------------------------------------
 
+-- Shared backdrop definition for addon windows.
 local BACKDROP = {
     bgFile = "Interface/Tooltips/UI-Tooltip-Background",
     edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
@@ -46,8 +59,11 @@ local BACKDROP = {
     insets = { left = 4, right = 4, top = 4, bottom = 4 },
 }
 
+-- Visual treatment for focused/active managed windows.
 local ACTIVE_BACKDROP  = { 0, 0, 0, 0.9 }
 local ACTIVE_BORDER    = { 0.45, 0.45, 0.45, 1 }
+
+-- Visual treatment for unfocused/inactive managed windows.
 local INACTIVE_BACKDROP = { 0.05, 0.05, 0.05, 0.55 }
 local INACTIVE_BORDER  = { 0.25, 0.25, 0.25, 0.6 }
 
@@ -55,9 +71,13 @@ local INACTIVE_BORDER  = { 0.25, 0.25, 0.25, 0.6 }
 -- Window management
 -------------------------------------------------------------------------------
 
+-- Frames registered here participate in simple focus management:
+-- one frame is "active", receives a stronger backdrop/border, and is raised.
 UI.managedFrames = {}
 UI.activeFrame = nil
 
+-- Marks a managed frame as active and updates all registered frames'
+-- z-ordering and visual emphasis accordingly.
 function UI:FocusFrame(target)
     if not target then
         return
@@ -78,6 +98,8 @@ function UI:FocusFrame(target)
     end
 end
 
+-- Clears focus when the active frame is hidden, then promotes the first other
+-- visible managed frame to active status.
 function UI:OnManagedFrameHidden(hiddenFrame)
     if self.activeFrame ~= hiddenFrame then
         return
@@ -93,6 +115,9 @@ function UI:OnManagedFrameHidden(hiddenFrame)
     end
 end
 
+-- Registers a frame with the UI focus manager.
+-- The frame becomes active when clicked or shown, and focus is reassigned
+-- if it is hidden while active.
 function UI:RegisterManagedFrame(frame)
     self.managedFrames[#self.managedFrames + 1] = frame
 
@@ -120,6 +145,9 @@ end
 -- frames inside a ScrollFrame's scroll child hierarchy.
 -------------------------------------------------------------------------------
 
+-- Makes an arbitrary region behave like a drag handle for `parentFrame`.
+-- This is used on scroll areas and "empty" UI space so the window can still
+-- be moved even when the user clicks outside specific controls.
 function UI:MakeDragProxy(region, parentFrame)
     region:EnableMouse(true)
 
@@ -141,6 +169,8 @@ end
 -- Factory helpers
 -------------------------------------------------------------------------------
 
+-- Creates a standard Blizzard button with common sizing/text setup.
+-- If `managedFrame` is provided, clicking the button also focuses that frame.
 local function createButton(parent, width, height, text, managedFrame)
     local button = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
     button:SetSize(width, height)
@@ -155,6 +185,8 @@ local function createButton(parent, width, height, text, managedFrame)
     return button
 end
 
+-- Creates a standard edit box with common settings.
+-- If `managedFrame` is provided, entering the field focuses that frame.
 local function createEditBox(parent, width, height, maxLetters, managedFrame)
     local edit = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
     edit:SetAutoFocus(false)
@@ -177,6 +209,9 @@ end
 -- Utilities
 -------------------------------------------------------------------------------
 
+-- Returns true when `text` is empty or currently ends with an operator/opening
+-- delimiter. This lets callers append another token directly instead of
+-- injecting an extra "+".
 local function endsWithOperatorOrOpen(text)
     if not text or text == "" then
         return true
@@ -195,6 +230,8 @@ end
 -- Chat output
 -------------------------------------------------------------------------------
 
+-- Prints a completed roll result in a human-friendly chat format.
+-- Prefers the RP character name from the payload; falls back to sender name.
 function UI:PrintRoll(sender, result)
     local name = result.rpName
     if not name or name == "" then
@@ -208,6 +245,9 @@ function UI:PrintRoll(sender, result)
     CRPM:Print(("%s rolls %s -> %s = %d"):format(name, expr, display, total))
 end
 
+-- Prints a "call for roll" announcement.
+-- When the local player is not the caller, also prints a reminder for how to
+-- respond using the stored last-call command.
 function UI:PrintRollCall(sender, expr, isLocalAuthor, rpName)
     local actor
     if isLocalAuthor then
@@ -231,6 +271,8 @@ end
 -- Init / toggle
 -------------------------------------------------------------------------------
 
+-- One-time UI bootstrap.
+-- Builds the addon's primary windows lazily on first use.
 function UI:Init()
     if self.initialized then
         return
@@ -242,6 +284,9 @@ function UI:Init()
     self:BuildInspectFrame()
 end
 
+-- Shows or hides the main character sheet window.
+-- A refresh is performed immediately before showing so the UI reflects the
+-- latest sheet state.
 function UI:ToggleSheet()
     if not self.sheetFrame then
         return
@@ -259,6 +304,9 @@ end
 -- Sheet interaction helpers
 -------------------------------------------------------------------------------
 
+-- Appends the selected attribute key to the quick-roll expression.
+-- If the current expression already ends with an operator/open delimiter,
+-- append directly; otherwise insert a "+" separator for convenience.
 function UI:AppendAttributeToQuickRoll(index)
     local attrs = CRPM.Sheet:GetAttributes()
     local attr = attrs[index]
@@ -282,12 +330,16 @@ function UI:AppendAttributeToQuickRoll(index)
     edit:SetCursorPosition(#current)
 end
 
+-- Commits the character name from the sheet UI into the sheet model, then
+-- refreshes the frame so any normalization/validation is reflected.
 function UI:CommitCharacterName()
     local text = self.sheetFrame.nameEdit:GetText() or ""
     CRPM.Sheet:SetName(text)
     self:RefreshSheetFrame()
 end
 
+-- Commits a single attribute name edit while preserving its existing value.
+-- Errors are reported to chat/UI and the sheet is then refreshed.
 function UI:CommitRowName(index)
     local attrs = CRPM.Sheet:GetAttributes()
     local attr = attrs[index]
@@ -304,6 +356,8 @@ function UI:CommitRowName(index)
     self:RefreshSheetFrame()
 end
 
+-- Commits a single attribute value edit while preserving its existing key.
+-- Errors are reported to chat/UI and the sheet is then refreshed.
 function UI:CommitRowValue(index)
     local attrs = CRPM.Sheet:GetAttributes()
     local attr = attrs[index]
@@ -324,6 +378,9 @@ end
 -- Sheet refresh
 -------------------------------------------------------------------------------
 
+-- Re-syncs the main character sheet window from the current sheet model.
+-- This function is intentionally dumb and one-way: it reads authoritative
+-- state from `CRPM.Sheet` and redraws visible controls.
 function UI:RefreshSheetFrame()
     local frame = self.sheetFrame
     if not frame then
@@ -353,6 +410,7 @@ end
 -- Inspect data
 -------------------------------------------------------------------------------
 
+-- Stores a remote/shared sheet payload and opens the inspect window for it.
 function UI:ShowInspectSheet(sender, sheet)
     self.inspectData = {
         sender = sender,
@@ -363,6 +421,8 @@ function UI:ShowInspectSheet(sender, sheet)
     self.inspectFrame:Show()
 end
 
+-- Re-syncs the inspect window from the last received inspect payload.
+-- Falls back to placeholder values when no inspect data is available.
 function UI:RefreshInspectFrame()
     local frame = self.inspectFrame
     if not frame then
@@ -401,6 +461,8 @@ end
 -- Build: Character Sheet
 -------------------------------------------------------------------------------
 
+-- Constructs the main editable character sheet window and all of its child
+-- controls. This is called once during UI initialization.
 function UI:BuildSheetFrame()
     local frame = CreateFrame("Frame", "CRPMSheetFrame", UIParent, "BackdropTemplate")
     self.sheetFrame = frame
@@ -418,6 +480,7 @@ function UI:BuildSheetFrame()
     frame:SetBackdropBorderColor(unpack(ACTIVE_BORDER))
     frame:Hide()
 
+    -- Allows the Escape key to close this top-level frame.
     table.insert(UISpecialFrames, frame:GetName())
 
     -- Title
@@ -448,7 +511,7 @@ function UI:BuildSheetFrame()
     quickRollLabel:SetPoint("TOPLEFT", 20, -94)
     quickRollLabel:SetText("Quick Roll")
 
-    -- Preset buttons next to the label
+    -- Preset buttons seed common dice expressions into the quick-roll field.
     local presets = { "1d20", "2d6" }
     local lastPreset = quickRollLabel
     for _, preset in ipairs(presets) do
@@ -472,7 +535,7 @@ function UI:BuildSheetFrame()
         lastPreset = btn
     end
 
-    -- Input field on a new line below the label/presets
+    -- Input field for ad hoc roll expressions.
     frame.quickRollEdit = createEditBox(frame, 200, 20, C.MAX_EXPRESSION_LEN, frame)
     frame.quickRollEdit:SetPoint("TOPLEFT", 20, -114)
     frame.quickRollEdit:SetScript("OnEnterPressed", function(edit)
@@ -483,7 +546,7 @@ function UI:BuildSheetFrame()
         edit:ClearFocus()
     end)
 
-    -- Roll and Call buttons to the right of the entry box
+    -- "Roll" executes locally; "Call" broadcasts the request to others.
     frame.quickRollButton = createButton(frame, 60, 22, "Roll", frame)
     frame.quickRollButton:SetPoint("LEFT", frame.quickRollEdit, "RIGHT", 6, 0)
     frame.quickRollButton:SetScript("OnClick", function()
@@ -513,23 +576,26 @@ function UI:BuildSheetFrame()
     headerValue:SetPoint("TOPLEFT", 216, -168)
     headerValue:SetText("Value")
 
-    -- Scroll area
+    -- Scroll area for editable attributes.
     frame.scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
     frame.scrollFrame:SetPoint("TOPLEFT", 20, -184)
     frame.scrollFrame:SetPoint("BOTTOMRIGHT", -32, 56)
 
-    -- Make the scroll frame itself a drag proxy so clicks in the
-    -- visible area below the scroll content still drag the window.
+    -- Make the visible scroll area draggable when clicking empty space.
     self:MakeDragProxy(frame.scrollFrame, frame)
 
     frame.scrollContent = CreateFrame("Frame", nil, frame.scrollFrame)
     frame.scrollContent:SetSize(328, 1)
     frame.scrollFrame:SetScrollChild(frame.scrollContent)
 
-    -- Scroll content is a drag proxy for gaps between rows.
+    -- Make gaps between rows inside the scroll child draggable as well.
     self:MakeDragProxy(frame.scrollContent, frame)
 
     -- Attribute rows
+    --
+    -- Rows are pre-created up to the configured maximum and then shown/hidden
+    -- during refresh. This avoids repeated frame creation and keeps the UI
+    -- logic simple and deterministic.
     frame.rows = {}
 
     for i = 1, C.MAX_ATTRIBUTES do
@@ -538,9 +604,10 @@ function UI:BuildSheetFrame()
         row:SetSize(320, 24)
         row:SetPoint("TOPLEFT", 0, -((i - 1) * 28))
 
-        -- Row background is a drag proxy for gaps between controls.
+        -- Row background acts as a drag surface between child widgets.
         self:MakeDragProxy(row, frame)
 
+        -- Attribute key/name editor.
         row.nameEdit = createEditBox(row, 160, 20, C.MAX_ATTRIBUTE_NAME_LEN, frame)
         row.nameEdit:SetPoint("LEFT", 0, 0)
         row.nameEdit:SetScript("OnEnterPressed", function(edit)
@@ -554,6 +621,7 @@ function UI:BuildSheetFrame()
             UI:CommitRowName(index)
         end)
 
+        -- Attribute value editor.
         row.valueEdit = createEditBox(row, 52, 20, 4, frame)
         row.valueEdit:SetPoint("LEFT", row.nameEdit, "RIGHT", 8, 0)
         row.valueEdit:SetJustifyH("CENTER")
@@ -568,12 +636,14 @@ function UI:BuildSheetFrame()
             UI:CommitRowValue(index)
         end)
 
+        -- Appends this attribute key into the quick-roll expression.
         row.useButton = createButton(row, 32, 20, "+", frame)
         row.useButton:SetPoint("LEFT", row.valueEdit, "RIGHT", 8, 0)
         row.useButton:SetScript("OnClick", function()
             UI:AppendAttributeToQuickRoll(index)
         end)
 
+        -- Opens the delete confirmation popup for this attribute row.
         row.deleteButton = createButton(row, 56, 20, "Remove", frame)
         row.deleteButton:SetPoint("LEFT", row.useButton, "RIGHT", 4, 0)
         row.deleteButton:SetScript("OnClick", function()
@@ -615,6 +685,8 @@ end
 -- Build: Inspect Frame
 -------------------------------------------------------------------------------
 
+-- Constructs the read-only inspect window used to display another player's
+-- shared sheet data.
 function UI:BuildInspectFrame()
     local frame = CreateFrame("Frame", "CRPMInspectFrame", UIParent, "BackdropTemplate")
     self.inspectFrame = frame
@@ -632,6 +704,7 @@ function UI:BuildInspectFrame()
     frame:SetBackdropBorderColor(unpack(ACTIVE_BORDER))
     frame:Hide()
 
+    -- Allows the Escape key to close this top-level frame.
     table.insert(UISpecialFrames, frame:GetName())
 
     frame.title = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
@@ -650,7 +723,7 @@ function UI:BuildInspectFrame()
     headerValue:SetPoint("TOPRIGHT", -40, -62)
     headerValue:SetText("Value")
 
-    -- Scroll area
+    -- Scroll area for remote/shared attributes.
     frame.scrollFrame = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
     frame.scrollFrame:SetPoint("TOPLEFT", 20, -78)
     frame.scrollFrame:SetPoint("BOTTOMRIGHT", -32, 48)
@@ -663,7 +736,10 @@ function UI:BuildInspectFrame()
 
     self:MakeDragProxy(frame.scrollContent, frame)
 
-    -- Rows
+    -- Read-only rows
+    --
+    -- As with the editable sheet, rows are pre-allocated to the maximum and
+    -- toggled visible during refresh.
     frame.rows = {}
 
     for i = 1, C.MAX_ATTRIBUTES do
