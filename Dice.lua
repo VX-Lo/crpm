@@ -1,25 +1,49 @@
 local ADDON_NAME, NS = ...
 local CRPM = NS.CRPM
 
+-- Public dice/parsing namespace.
 CRPM.Dice = CRPM.Dice or {}
 local Dice = CRPM.Dice
 
+-- Shared constants used for validation and safety limits.
 local C = CRPM.Constants
 
+-- Returns true when `ch` is a decimal digit.
 local function isDigit(ch)
     return ch and ch:match("%d") ~= nil
 end
 
+-- Returns true when `ch` may begin an identifier.
+-- Attribute names are limited to letters/underscore at the first character,
+-- with later characters handled separately in the tokenizer.
 local function isAlphaOrUnderscore(ch)
     return ch and ch:match("[%a_]") ~= nil
 end
 
+-- Converts a sanitized expression string into a token stream.
+--
+-- Supported token classes:
+--   - NUMBER    integer literal
+--   - IDENT     attribute identifier
+--   - DICE      `d` in dice notation, e.g. `2d6` or `d20`
+--   - PLUS      `+`
+--   - MINUS     `-`
+--   - MUL       `*`
+--   - DIV       `/`
+--   - LPAREN    `(`
+--   - RPAREN    `)`
+--   - LBRACKET  `[`
+--   - RBRACKET  `]`
+--
+-- The tokenizer is intentionally strict and rejects any unsupported character
+-- early so later stages can assume well-formed lexical input.
 local function tokenize(expr)
     local tokens = {}
     local len = #expr
     local i = 1
     local prevType = nil
 
+    -- Appends a token and enforces the global token-count safety limit.
     local function push(tokenType, text, value)
         tokens[#tokens + 1] = {
             type = tokenType,
@@ -35,6 +59,14 @@ local function tokenize(expr)
         return true
     end
 
+    -- Returns true when a bare `dNN` token sequence should be interpreted as
+    -- standalone dice notation rather than as part of an identifier.
+    --
+    -- Examples:
+    --   - `d20`        valid at expression start
+    --   - `+d6`        valid after an operator
+    --   - `(d8+1)`     valid after an opening delimiter
+    --   - `2d6`        also valid, handled separately by allowing NUMBER then DICE
     local function prevAllowsStandaloneDice()
         return prevType == nil
             or prevType == "PLUS"
@@ -48,9 +80,12 @@ local function tokenize(expr)
     while i <= len do
         local ch = expr:sub(i, i)
 
+        -- Whitespace is tolerated here even though callers generally sanitize
+        -- it out first. This keeps the tokenizer robust in isolation.
         if ch:match("%s") then
             i = i + 1
 
+        -- Integer literal.
         elseif isDigit(ch) then
             local j = i
             while j <= len and isDigit(expr:sub(j, j)) do
@@ -65,9 +100,12 @@ local function tokenize(expr)
 
             i = j
 
+        -- Identifier or dice marker.
         elseif isAlphaOrUnderscore(ch) then
             local nextCh = expr:sub(i + 1, i + 1)
 
+            -- Treat `d`/`D` followed by digits as dice notation when it appears
+            -- in a syntactically valid position.
             if (ch == "d" or ch == "D") and isDigit(nextCh)
                and (prevAllowsStandaloneDice() or prevType == "NUMBER") then
                 local ok, err = push("DICE", "d")
@@ -77,6 +115,7 @@ local function tokenize(expr)
 
                 i = i + 1
             else
+                -- Attribute identifier.
                 local j = i
                 while j <= len and expr:sub(j, j):match("[%w_]") do
                     j = j + 1
@@ -159,6 +198,8 @@ local function tokenize(expr)
     return tokens
 end
 
+-- Returns true when a token may legally terminate a factor.
+-- Used to detect places where implicit multiplication should be inserted.
 local function canEndFactor(token)
     return token
         and (token.type == "NUMBER"
@@ -167,6 +208,8 @@ local function canEndFactor(token)
             or token.type == "RBRACKET")
 end
 
+-- Returns true when a token may legally begin a factor.
+-- Used to detect places where implicit multiplication should be inserted.
 local function canStartFactor(token)
     return token
         and (token.type == "NUMBER"
@@ -176,6 +219,15 @@ local function canStartFactor(token)
             or token.type == "DICE")
 end
 
+-- Inserts synthetic multiplication operators where adjacency implies
+-- multiplication.
+--
+-- Examples:
+--   - `2(str)`  -> `2*(str)`
+--   - `(1+2)d4` is not supported as dice, but adjacency is still treated as
+--     multiplication where applicable
+--   - `2d6` is explicitly preserved as dice notation rather than rewritten to
+--     `2*d6`
 local function insertImplicitMultiplication(tokens)
     local out = {}
 
@@ -183,6 +235,7 @@ local function insertImplicitMultiplication(tokens)
         local prev = out[#out]
 
         if prev and canEndFactor(prev) and canStartFactor(token) then
+            -- Preserve canonical `NUMBER` + `DICE` adjacency as dice notation.
             if not (prev.type == "NUMBER" and token.type == "DICE") then
                 out[#out + 1] = {
                     type = "MUL",
@@ -197,9 +250,16 @@ local function insertImplicitMultiplication(tokens)
     return out
 end
 
+-------------------------------------------------------------------------------
+-- Recursive-descent parser
+-------------------------------------------------------------------------------
+
+-- Simple Pratt-free recursive-descent parser for the supported arithmetic
+-- grammar. The parser consumes a token stream and produces a small AST.
 local Parser = {}
 Parser.__index = Parser
 
+-- Creates a parser instance over the given token list.
 function Parser:New(tokens)
     return setmetatable({
         tokens = tokens,
@@ -207,11 +267,15 @@ function Parser:New(tokens)
     }, self)
 end
 
+-- Returns the current token or a token at `offset` relative to the current
+-- parser position, without consuming it.
 function Parser:Peek(offset)
     offset = offset or 0
     return self.tokens[self.pos + offset]
 end
 
+-- Consumes the current token if it matches `expectedType`.
+-- Returns the token on success or `nil, errorMessage` on failure.
 function Parser:Consume(expectedType)
     local token = self:Peek()
     if not token then
@@ -226,6 +290,7 @@ function Parser:Consume(expectedType)
     return token
 end
 
+-- Parses a full expression and verifies that all tokens were consumed.
 function Parser:Parse()
     local node, err = self:ParseExpression()
     if not node then
@@ -239,6 +304,8 @@ function Parser:Parse()
     return node
 end
 
+-- Parses additive expressions:
+--   term (("+" | "-") term)*
 function Parser:ParseExpression()
     local node, err = self:ParseTerm()
     if not node then
@@ -269,6 +336,8 @@ function Parser:ParseExpression()
     return node
 end
 
+-- Parses multiplicative expressions:
+--   factor (("*" | "/") factor)*
 function Parser:ParseTerm()
     local node, err = self:ParseFactor()
     if not node then
@@ -299,6 +368,8 @@ function Parser:ParseTerm()
     return node
 end
 
+-- Parses unary prefix operators and primary expressions:
+--   ("+" | "-") factor | primary
 function Parser:ParseFactor()
     local token = self:Peek()
     if token and (token.type == "PLUS" or token.type == "MINUS") then
@@ -319,12 +390,18 @@ function Parser:ParseFactor()
     return self:ParsePrimary()
 end
 
+-- Parses the atomic building blocks of the grammar:
+--   - integer literals
+--   - attribute references
+--   - dice expressions (`2d6`, `d20`)
+--   - grouped subexpressions with `()` or `[]`
 function Parser:ParsePrimary()
     local token = self:Peek()
     if not token then
         return nil, "Unexpected end of expression."
     end
 
+    -- Dice with explicit count: `NdS`.
     if token.type == "NUMBER" and self:Peek(1) and self:Peek(1).type == "DICE" then
         local countToken = self:Consume("NUMBER")
         local _, errDice = self:Consume("DICE")
@@ -344,6 +421,7 @@ function Parser:ParsePrimary()
         }
     end
 
+    -- Dice with implicit count of 1: `dS`.
     if token.type == "DICE" then
         local _, errDice = self:Consume("DICE")
         if errDice then
@@ -378,6 +456,8 @@ function Parser:ParsePrimary()
         }
     end
 
+    -- Support both parentheses and brackets for grouping. The latter are
+    -- accepted as a convenience for users who visually distinguish nesting.
     if token.type == "LPAREN" or token.type == "LBRACKET" then
         local closeType = token.type == "LPAREN" and "RPAREN" or "RBRACKET"
         self.pos = self.pos + 1
@@ -398,6 +478,16 @@ function Parser:ParsePrimary()
     return nil, ("Unexpected token '%s'."):format(token.text or token.type)
 end
 
+-------------------------------------------------------------------------------
+-- Display / evaluation helpers
+-------------------------------------------------------------------------------
+
+-- Builds the "expanded" expression string by replacing attribute identifiers
+-- with their numeric values, while preserving the user's original operators
+-- and token order.
+--
+-- This operates on the original token stream so synthetic `*` tokens inserted
+-- later for implicit multiplication do not appear in the expanded text.
 local function buildExpandedExpression(tokens, attrLookup)
     local parts = {}
 
@@ -419,6 +509,9 @@ local function buildExpandedExpression(tokens, attrLookup)
     return table.concat(parts)
 end
 
+-- Integer division policy helper.
+-- Lua division yields a floating-point result; this addon defines division as
+-- truncation toward zero so negative results behave predictably for users.
 local function truncateTowardZero(value)
     if value < 0 then
         return math.ceil(value)
@@ -427,17 +520,23 @@ local function truncateTowardZero(value)
     return math.floor(value)
 end
 
+-- Enforces an absolute numeric safety bound on intermediate and final results.
+-- The evaluator calls this repeatedly to guard against runaway expressions.
 local function checkSafeRange(value)
     if math.abs(value) > C.MAX_ABS_TOTAL then
         error(("Result exceeds safe numeric range (%d)."):format(C.MAX_ABS_TOTAL))
     end
 end
 
+-- Returns true when a child's rendered expression must be parenthesized to
+-- preserve evaluation order under the current parent operator.
 local function needsParens(childPrecedence, parentPrecedence, op, isRightChild)
     if childPrecedence < parentPrecedence then
         return true
     end
 
+    -- Right children of subtraction and division require parentheses when
+    -- precedence is equal because those operators are not associative.
     if isRightChild and childPrecedence == parentPrecedence and (op == "-" or op == "/") then
         return true
     end
@@ -445,6 +544,7 @@ local function needsParens(childPrecedence, parentPrecedence, op, isRightChild)
     return false
 end
 
+-- Wraps a rendered child expression in parentheses only when required.
 local function wrapDisplay(display, childPrecedence, parentPrecedence, op, isRightChild)
     if needsParens(childPrecedence, parentPrecedence, op, isRightChild) then
         return "(" .. display .. ")"
@@ -453,6 +553,15 @@ local function wrapDisplay(display, childPrecedence, parentPrecedence, op, isRig
     return display
 end
 
+-- Recursively evaluates an AST node.
+--
+-- Returns a table with:
+--   value       numeric result
+--   display     human-readable evaluated expression
+--   precedence  precedence level used for display parenthesization
+--
+-- Errors are raised via `error(...)` and converted to `nil, message` by the
+-- public `Evaluate` wrapper.
 local function evalNode(node, attrLookup, ctx)
     if node.kind == "INT" then
         return {
@@ -531,6 +640,8 @@ local function evalNode(node, attrLookup, ctx)
             error(("Dice can have at most %d sides."):format(C.MAX_DICE_SIDES))
         end
 
+        -- Allow `0dN` as a benign zero-valued group. This keeps parsing simple
+        -- and avoids surprising failures in generated or user-built formulas.
         if count == 0 then
             return {
                 value = 0,
@@ -555,6 +666,8 @@ local function evalNode(node, attrLookup, ctx)
         if count <= C.MAX_DICE_DISPLAY then
             display = "[" .. table.concat(results, ", ") .. "]"
         else
+            -- Collapse very large dice groups to keep chat output bounded and
+            -- readable.
             display = ("[%dd%d sum=%d]"):format(count, sides, sum)
         end
 
@@ -602,6 +715,28 @@ local function evalNode(node, attrLookup, ctx)
     error("Unknown AST node.")
 end
 
+-------------------------------------------------------------------------------
+-- Public API
+-------------------------------------------------------------------------------
+
+-- Evaluates a roll expression against a supplied attribute lookup table.
+--
+-- Parameters:
+--   expr       - expression string entered by the user
+--   attrLookup - optional case-insensitive map of attribute name -> value
+--
+-- Returns on success:
+--   {
+--       expr      = sanitized original expression,
+--       expanded  = expression with attributes replaced by values,
+--       display   = evaluated display string including dice results,
+--       rolls     = flat list of raw die results,
+--       total     = final integer result,
+--       timestamp = client timestamp
+--   }
+--
+-- Returns on failure:
+--   nil, errorMessage
 function Dice:Evaluate(expr, attrLookup)
     attrLookup = attrLookup or {}
 
@@ -624,14 +759,14 @@ function Dice:Evaluate(expr, attrLookup)
         return nil, tokenErr
     end
 
-    -- Build the expanded expression from the ORIGINAL token list,
-    -- before implicit multiplication adds synthetic operators.
+    -- Build the expanded expression from the original token list before
+    -- implicit multiplication inserts synthetic operators.
     local expanded, expandErr = buildExpandedExpression(tokens, attrLookup)
     if not expanded then
         return nil, expandErr
     end
 
-    -- Now insert implicit multiplication for the parser.
+    -- Insert synthetic multiplication operators for parser consumption.
     local augmentedTokens = insertImplicitMultiplication(tokens)
 
     local parser = Parser:New(augmentedTokens)
@@ -641,9 +776,12 @@ function Dice:Evaluate(expr, attrLookup)
     end
 
     local ctx = {
+        -- Accumulates raw die rolls in evaluation order.
         rolls = {},
     }
 
+    -- Convert internal evaluator exceptions into the addon's usual
+    -- `nil, message` error contract.
     local ok, evaluated = pcall(function()
         return evalNode(ast, attrLookup, ctx)
     end)
