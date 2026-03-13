@@ -1,11 +1,19 @@
 local ADDON_NAME, NS = ...
 local CRPM = NS.CRPM
 
+-- Public character sheet subsystem.
 CRPM.Sheet = CRPM.Sheet or {}
 local Sheet = CRPM.Sheet
 
+-- Shared constants module.
 local C = CRPM.Constants
 
+-------------------------------------------------------------------------------
+-- Utility functions
+-------------------------------------------------------------------------------
+
+-- Converts a numeric-like value into an integer.
+-- Returns `nil` when the input is non-numeric or not an exact integer.
 local function toInteger(value)
     local num = tonumber(value)
     if not num then
@@ -19,12 +27,22 @@ local function toInteger(value)
     return num
 end
 
+-- Normalizes an attribute key:
+-- - trims whitespace
+-- - lowercases
+-- Used for all internal lookups to ensure consistent comparison.
 local function normalizeKey(key)
     return CRPM.Trim(key or ""):lower()
 end
 
 Sheet.NormalizeKey = normalizeKey
 
+-- Sanitizes a character name for persistence or transmission.
+-- Rules:
+--   - Trim leading/trailing whitespace
+--   - Remove control and delimiter characters
+--   - Fallback to current player’s name
+--   - Enforce maximum length
 local function sanitizeCharacterName(name)
     name = CRPM.Trim(name or "")
 
@@ -32,8 +50,10 @@ local function sanitizeCharacterName(name)
         name = UnitName("player") or "Unknown"
     end
 
+    -- Strip invalid characters (control, pipe, etc.)
     name = name:gsub("[%c|]", "")
 
+    -- Trim to maximum length
     if #name > C.MAX_CHARACTER_NAME_LEN then
         name = name:sub(1, C.MAX_CHARACTER_NAME_LEN)
     end
@@ -45,6 +65,14 @@ local function sanitizeCharacterName(name)
     return name
 end
 
+-------------------------------------------------------------------------------
+-- Validation helpers
+-------------------------------------------------------------------------------
+
+-- Validates attribute key structure:
+-- * must be alphanumeric with optional underscore
+-- * must not start with a digit
+-- * cannot resemble dice notation ("d6", "D12", etc.)
 function Sheet:IsValidAttributeKey(key)
     key = CRPM.Trim(key or "")
 
@@ -67,6 +95,8 @@ function Sheet:IsValidAttributeKey(key)
     return true
 end
 
+-- Validates an attribute’s numeric value.
+-- Must be an integer within allowed limits.
 function Sheet:IsValidAttributeValue(value)
     if type(value) ~= "number" or value ~= math.floor(value) then
         return false, "Attribute values must be integers."
@@ -79,6 +109,12 @@ function Sheet:IsValidAttributeValue(value)
     return true
 end
 
+-------------------------------------------------------------------------------
+-- Persistence and initialization
+-------------------------------------------------------------------------------
+
+-- Initializes and sanitizes all saved variable tables.
+-- Ensures that CRPM_Sheet and CRPM_Settings exist and are well-formed.
 function Sheet:InitSavedVariables()
     if type(CRPM_Sheet) ~= "table" then
         CRPM_Sheet = {}
@@ -97,6 +133,7 @@ function Sheet:InitSavedVariables()
     local sanitized = {}
     local seen = {}
 
+    -- Sanitize stored attributes; reject any invalid, duplicated, or excessive entries.
     for _, attr in ipairs(CRPM_Sheet.attrs) do
         if #sanitized >= C.MAX_ATTRIBUTES then
             break
@@ -123,20 +160,29 @@ function Sheet:InitSavedVariables()
     CRPM_Sheet.attrs = sanitized
 end
 
+-------------------------------------------------------------------------------
+-- Basic accessors
+-------------------------------------------------------------------------------
+
+-- Returns sanitized character name.
 function Sheet:GetName()
     CRPM_Sheet.name = sanitizeCharacterName(CRPM_Sheet.name)
     return CRPM_Sheet.name
 end
 
+-- Sets and sanitizes character name in saved variables.
 function Sheet:SetName(name)
     CRPM_Sheet.name = sanitizeCharacterName(name)
     return true
 end
 
+-- Returns live attribute list (read/write reference).
 function Sheet:GetAttributes()
     return CRPM_Sheet.attrs
 end
 
+-- Builds a normalized lookup table for evaluation / interpolation.
+-- Keys are lowercase normalized attribute names.
 function Sheet:BuildLookup()
     local lookup = {}
 
@@ -147,6 +193,11 @@ function Sheet:BuildLookup()
     return lookup
 end
 
+-------------------------------------------------------------------------------
+-- Searching / duplication checks
+-------------------------------------------------------------------------------
+
+-- Returns an attribute’s value and its actual case-preserved key, or nil if not found.
 function Sheet:Lookup(key)
     local normalized = normalizeKey(key)
 
@@ -159,6 +210,8 @@ function Sheet:Lookup(key)
     return nil, nil
 end
 
+-- Returns true if another attribute with the same normalized key exists.
+-- Optionally skips a specific index during inline editing.
 function Sheet:HasDuplicateKey(key, skipIndex)
     local normalized = normalizeKey(key)
 
@@ -171,6 +224,7 @@ function Sheet:HasDuplicateKey(key, skipIndex)
     return false
 end
 
+-- Generates a non-conflicting default key name ("Attr1", "Attr2", ...).
 function Sheet:GenerateDefaultKey()
     for i = 1, C.MAX_ATTRIBUTES do
         local candidate = "Attr" .. i
@@ -182,6 +236,12 @@ function Sheet:GenerateDefaultKey()
     return nil
 end
 
+-------------------------------------------------------------------------------
+-- CRUD operations
+-------------------------------------------------------------------------------
+
+-- Adds a new attribute row to the sheet.
+-- Performs full validation and manages key collisions gracefully.
 function Sheet:AddAttribute(key, value)
     local attrs = CRPM_Sheet.attrs
 
@@ -218,6 +278,8 @@ function Sheet:AddAttribute(key, value)
     return true
 end
 
+-- Modifies an existing attribute by index.
+-- Rejects invalid indices, duplicates, or invalid data.
 function Sheet:SetAttribute(index, key, value)
     index = tonumber(index)
 
@@ -250,6 +312,7 @@ function Sheet:SetAttribute(index, key, value)
     return true
 end
 
+-- Removes an attribute row by index.
 function Sheet:RemoveAttribute(index)
     index = tonumber(index)
 
@@ -261,6 +324,13 @@ function Sheet:RemoveAttribute(index)
     return true
 end
 
+-------------------------------------------------------------------------------
+-- Serialization / Deserialization
+-------------------------------------------------------------------------------
+
+-- Serializes the sheet into a compact semicolon-delimited string for sharing.
+-- Format:
+--   name=<escaped name>;a=<escaped key>,<int>;a=<escaped key>,<int>;...
 function Sheet:SerializeCurrent()
     local escape = CRPM.EscapeField
     local parts = {
@@ -274,6 +344,8 @@ function Sheet:SerializeCurrent()
     return table.concat(parts, ";")
 end
 
+-- Parses a serialized sheet payload (from another player, for example).
+-- Returns a temporary table structure; does not modify saved variables directly.
 function Sheet:DeserializeSheet(payload)
     if type(payload) ~= "string" or payload == "" then
         return nil, "Empty sheet payload."
@@ -288,6 +360,7 @@ function Sheet:DeserializeSheet(payload)
 
     local seen = {}
 
+    -- Parse by key-value components separated by `;`
     for part in payload:gmatch("[^;]+") do
         local key, value = part:match("^([^=]+)=(.*)$")
 
