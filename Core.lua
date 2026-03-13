@@ -1,21 +1,33 @@
 local ADDON_NAME, NS = ...
 
+-- Root addon namespace.
+-- `NS` is the shared table passed between addon files via the Lua varargs
+-- convention used by WoW addons.
 NS.CRPM = NS.CRPM or {}
 local CRPM = NS.CRPM
 
+-- Addon metadata used internally for identification and display.
 CRPM.AddonName = ADDON_NAME
 CRPM.Version = "0.1.0"
 
+-- Centralized constants.
+--
+-- Keeping limits in a single table improves maintainability, makes validation
+-- policy explicit, and avoids magic numbers across modules.
 CRPM.Constants = {
+    -- Addon message prefix registered and used by the communication layer.
     ADDON_PREFIX = "CRPM",
 
+    -- Character sheet limits.
     MAX_ATTRIBUTES = 100,
     MAX_ATTRIBUTE_NAME_LEN = 64,
     MAX_CHARACTER_NAME_LEN = 32,
 
+    -- Allowed attribute value range.
     MIN_ATTRIBUTE_VALUE = -99,
     MAX_ATTRIBUTE_VALUE = 99,
 
+    -- Expression parser / evaluator guardrails.
     MAX_EXPRESSION_LEN = 64,
     MAX_TOKENS = 256,
     MAX_DICE_COUNT = 100,
@@ -23,13 +35,18 @@ CRPM.Constants = {
     MAX_DICE_DISPLAY = 20,
     MAX_ABS_TOTAL = 1000000000,
 
+    -- Limits for serialized/shared roll payloads.
     MAX_SHARED_EXPR_LEN = 60,
     MAX_SHARED_DISPLAY_LEN = 80,
 
+    -- Message transport and chunking limits.
     MAX_MESSAGE_LEN = 220,
     MAX_SHEET_CHUNK = 180,
 }
 
+-- Trims leading and trailing whitespace from a string.
+-- Non-string inputs are normalized to the empty string to keep downstream
+-- callers simple and defensive.
 local function trim(value)
     if type(value) ~= "string" then
         return ""
@@ -40,10 +57,17 @@ local function trim(value)
     return value
 end
 
+-- Exported for use by sibling modules.
 CRPM.Trim = trim
 
+-- Stores the most recent roll-call expression received from another player.
+-- Used by `/crpm lastcall`.
 CRPM.lastCall = nil
 
+-- Escapes delimiter characters used by the addon's lightweight wire format.
+--
+-- This is not a general URL encoder; it is a narrowly scoped field encoder for
+-- safe serialization into addon messages.
 function CRPM.EscapeField(value)
     value = tostring(value or "")
     value = value:gsub("%%", "%%25")
@@ -56,6 +80,10 @@ function CRPM.EscapeField(value)
     return value
 end
 
+-- Reverses `CRPM.EscapeField`.
+--
+-- Decoding order matters: more specific escaped sequences are restored before
+-- `%25` so that literal percent signs are not expanded too early.
 function CRPM.UnescapeField(value)
     value = tostring(value or "")
     value = value:gsub("%%0D", "\r")
@@ -68,6 +96,8 @@ function CRPM.UnescapeField(value)
     return value
 end
 
+-- Low-level chat output helper.
+-- Falls back to `print` if the default chat frame is unavailable.
 local function chatPrint(message)
     if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
         DEFAULT_CHAT_FRAME:AddMessage(message)
@@ -76,14 +106,19 @@ local function chatPrint(message)
     end
 end
 
+-- Prints a normal informational addon message with a consistent prefix.
 function CRPM:Print(message)
     chatPrint("|cff69ccf0[CRPM]|r " .. tostring(message))
 end
 
+-- Prints an error message with a consistent prefix and error coloring.
 function CRPM:Error(message)
     chatPrint("|cffff4040[CRPM]|r " .. tostring(message))
 end
 
+-- Returns a shortened player name suitable for display.
+-- Prefers Blizzard's `Ambiguate` when available, with a simple fallback that
+-- strips the realm portion from `Name-Realm`.
 function CRPM:ShortPlayerName(fullName)
     if not fullName or fullName == "" then
         return "Unknown"
@@ -97,6 +132,8 @@ function CRPM:ShortPlayerName(fullName)
     return short or fullName
 end
 
+-- Returns the local player's full cross-realm name when possible.
+-- Falls back gracefully if realm information is unavailable.
 function CRPM:GetPlayerFullName()
     local name, realm = UnitFullName("player")
     if name and realm and realm ~= "" then
@@ -106,6 +143,11 @@ function CRPM:GetPlayerFullName()
     return name or UnitName("player") or "Unknown"
 end
 
+-- Resolves the current target into a full player name.
+--
+-- Returns:
+--   - `fullName, nil` on success
+--   - `nil, errorMessage` on failure
 function CRPM:GetTargetFullName()
     if not UnitExists("target") then
         return nil, "You have no target."
@@ -132,6 +174,11 @@ function CRPM:GetTargetFullName()
     return name
 end
 
+-- Splits a slash-command payload into:
+--   1. the first token as the command
+--   2. the remaining text as the argument string
+--
+-- The command is normalized to lowercase for case-insensitive dispatch.
 function CRPM:SplitCommand(input)
     input = trim(input or "")
     if input == "" then
@@ -142,12 +189,17 @@ function CRPM:SplitCommand(input)
     return (command or ""):lower(), rest or ""
 end
 
+-- Normalizes expression input before parsing/evaluation.
+-- Current policy trims leading/trailing whitespace and removes all internal
+-- whitespace to simplify later tokenization.
 function CRPM:SanitizeExpressionInput(expr)
     expr = trim(expr or "")
     expr = expr:gsub("%s+", "")
     return expr
 end
 
+-- Prints user-facing slash-command help text.
+-- Kept local because it has no state beyond `CRPM:Print`.
 local function printHelp()
     CRPM:Print("Commands:")
     CRPM:Print("/crpm sheet - open your character sheet")
@@ -160,6 +212,19 @@ local function printHelp()
     CRPM:Print("/crpm help - show this help")
 end
 
+-- Evaluates a roll expression and optionally publishes the result.
+--
+-- Parameters:
+--   expr    - user-entered roll expression
+--   publish - when true, broadcast the result through the communication layer
+--
+-- Processing flow:
+--   1. sanitize input
+--   2. build an attribute lookup from the current sheet
+--   3. evaluate through the dice subsystem
+--   4. enrich the result with local player metadata
+--   5. print locally
+--   6. optionally broadcast
 function CRPM:ExecuteRoll(expr, publish)
     expr = self:SanitizeExpressionInput(expr)
 
@@ -179,6 +244,7 @@ function CRPM:ExecuteRoll(expr, publish)
         return
     end
 
+    -- Attach sender and RP-facing character name for local display and sharing.
     result.source = self:GetPlayerFullName()
     result.rpName = self.Sheet:GetName()
 
@@ -191,6 +257,7 @@ function CRPM:ExecuteRoll(expr, publish)
     end
 end
 
+-- Broadcasts a "call for roll" request to other players.
 function CRPM:CallForRoll(expr)
     expr = self:SanitizeExpressionInput(expr)
 
@@ -205,9 +272,11 @@ function CRPM:CallForRoll(expr)
         return
     end
 
+    -- Print as if authored locally for consistent UX.
     self.UI:PrintRollCall(self:GetPlayerFullName(), expr, true)
 end
 
+-- Replays the most recent remote roll call received by this client.
 function CRPM:RollLastCall()
     if not self.lastCall or self.lastCall == "" then
         self:Error("No pending roll call.")
@@ -217,6 +286,11 @@ function CRPM:RollLastCall()
     self:ExecuteRoll(self.lastCall, true)
 end
 
+-- Requests a character sheet from another player.
+--
+-- If `target` is omitted, the player's current target is used. If the supplied
+-- name lacks a realm suffix, the local realm is appended to improve whisper
+-- routing consistency.
 function CRPM:RequestInspect(target)
     target = CRPM.Trim(target or "")
 
@@ -247,6 +321,8 @@ function CRPM:RequestInspect(target)
     self:Print(("Requested character sheet from %s."):format(self:ShortPlayerName(target)))
 end
 
+-- Central slash-command dispatcher.
+-- Keeps each command branch small and delegates actual work to focused methods.
 function CRPM:HandleSlash(input)
     local command, rest = self:SplitCommand(input)
 
@@ -284,6 +360,11 @@ function CRPM:HandleSlash(input)
     printHelp()
 end
 
+-- One-time addon initialization entry point.
+--
+-- Called after the WoW client reports `ADDON_LOADED` for this addon. Each
+-- subsystem is initialized only if present, which keeps module coupling loose
+-- and supports staged development.
 function CRPM:OnAddonLoaded()
     if self._loaded then
         return
@@ -303,10 +384,11 @@ function CRPM:OnAddonLoaded()
         self.UI:Init()
     end
 
-    -- Init messages are dumb
+    -- Startup spam is intentionally suppressed.
     -- self:Print(("Loaded v%s. Type /crpm help."):format(self.Version))
 end
 
+-- Slash command registration.
 SLASH_CRPM1 = "/crpm"
 SLASH_CRPM2 = "/cr"
 
@@ -314,12 +396,18 @@ SlashCmdList.CRPM = function(msg)
     CRPM:HandleSlash(msg)
 end
 
+-- Central event frame for addon lifecycle and communication events.
 local eventFrame = CreateFrame("Frame")
 CRPM.EventFrame = eventFrame
 
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("CHAT_MSG_ADDON")
 
+-- Event dispatcher.
+--
+-- Current responsibilities:
+--   - complete addon initialization when our addon loads
+--   - forward addon chat traffic to the communication subsystem
 eventFrame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
         local loadedName = ...
